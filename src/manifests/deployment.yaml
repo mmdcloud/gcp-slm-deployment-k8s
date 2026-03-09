@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-3b-v1
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: llama-container
+        image: your-registry/llama-service:v1
+        resources:
+          limits:
+            nvidia.com/gpu: 1  # Request 1 GPU
+        ports:
+        - containerPort: 3000
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
