@@ -1,0 +1,33 @@
+# k8s/base/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-serving
+  labels:
+    app.kubernetes.io/part-of: llm-serving
+    istio-injection: disabled
+
+---
+# Kubernetes Service Account linked to GCP Workload Identity
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-workload-ksa
+  namespace: llm-serving
+  annotations:
+    # Replace with your GCP SA email from Terraform output
+    iam.gke.io/gcp-service-account: llm-workload-sa@YOUR_PROJECT.iam.gserviceaccount.com
+  labels:
+    app.kubernetes.io/part-of: llm-serving
+
+---
+# Secret for pulling from Artifact Registry (alternative to Workload Identity)
+# Only needed if NOT using Workload Identity
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: gcr-pull-secret
+#   namespace: llm-serving
+# type: kubernetes.io/dockerconfigjson
+# data:
+#   .dockerconfigjson: BASE64_ENCODED_DOCKER_CONFIG

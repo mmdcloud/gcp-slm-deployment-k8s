@@ -1,22 +1,231 @@
+# k8s/base/deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: llama-3b-v1
+  name: tinyllama-service
+  namespace: llm-serving
+  labels:
+    app: tinyllama-service
+    version: v1
+    app.kubernetes.io/part-of: llm-serving
+    app.kubernetes.io/component: inference-server
 spec:
+  # Initial replica count – KEDA ScaledObject will override this
   replicas: 1
+
+  selector:
+    matchLabels:
+      app: tinyllama-service
+      version: v1
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0    # Zero-downtime deploys
+
   template:
+    metadata:
+      labels:
+        app: tinyllama-service
+        version: v1
+        app.kubernetes.io/part-of: llm-serving
+      annotations:
+        # Prometheus scraping
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "3000"
+        prometheus.io/path:   "/metrics"
+        # Rollout trigger on config change
+        checksum/config: "{{ include (print $.Template.BasePath '/configmap.yaml') . | sha256sum }}"
+
     spec:
+      serviceAccountName: llm-workload-ksa
+
+      # Tolerate GPU node taint
+      tolerations:
+        - key:      "nvidia.com/gpu"
+          operator: "Equal"
+          value:    "present"
+          effect:   "NoSchedule"
+
+      # Prefer GPU nodes
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: pool-name
+                    operator: In
+                    values: [gpu-pool]
+        # Spread replicas across nodes
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: tinyllama-service
+                topologyKey: kubernetes.io/hostname
+
+      # Init container: pre-warm model cache from GCS (optional)
+      initContainers:
+        - name: cache-warmer
+          image: google/cloud-sdk:slim
+          command:
+            - sh
+            - -c
+            - |
+              echo "Checking model cache…"
+              if [ ! -f /cache/model.loaded ]; then
+                gsutil -m cp -r gs://YOUR_MODEL_BUCKET/tinyllama/ /cache/ && touch /cache/model.loaded
+              fi
+          volumeMounts:
+            - name: model-cache
+              mountPath: /cache
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+
       containers:
-      - name: llama-container
-        image: your-registry/llama-service:v1
-        resources:
-          limits:
-            nvidia.com/gpu: 1  # Request 1 GPU
-        ports:
-        - containerPort: 3000
-        env:
-        - name: HF_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: hf-token-secret
-              key: token
+        - name: tinyllama-service
+          # Replace with your Artifact Registry image URL
+          image: us-central1-docker.pkg.dev/YOUR_PROJECT/llm-models/tinyllama-service:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+            - name: metrics
+              containerPort: 3000
+              protocol: TCP
+
+          env:
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: OMP_NUM_THREADS
+              value: "4"
+            - name: TRANSFORMERS_CACHE
+              value: "/cache"
+            - name: BENTOML_HOME
+              value: "/root/bentoml"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu:             "2"
+              memory:          "6Gi"
+              nvidia.com/gpu:  "1"
+            limits:
+              cpu:             "4"
+              memory:          "12Gi"
+              nvidia.com/gpu:  "1"
+
+          volumeMounts:
+            - name: model-cache
+              mountPath: /cache
+            - name: tmp
+              mountPath: /tmp
+            - name: shm
+              mountPath: /dev/shm      # Required for torch multiprocessing
+
+          # Liveness: restart if service is hung
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 90
+            periodSeconds: 20
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # Readiness: remove from LB until model is loaded
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # Startup: allow up to 5min for model to load
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            failureThreshold: 30
+            periodSeconds: 10
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false         # BentoML needs root for GPU drivers
+
+      volumes:
+        - name: model-cache
+          emptyDir:
+            medium: ""
+            sizeLimit: 20Gi
+        - name: tmp
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+
+      terminationGracePeriodSeconds: 60
+
+---
+# ── Service ───────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: tinyllama-service
+  namespace: llm-serving
+  labels:
+    app: tinyllama-service
+    app.kubernetes.io/part-of: llm-serving
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'    # Container-native load balancing
+spec:
+  type: ClusterIP
+  selector:
+    app: tinyllama-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 3000
+      protocol: TCP
+
+---
+# ── PodDisruptionBudget ───────────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tinyllama-pdb
+  namespace: llm-serving
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: tinyllama-service

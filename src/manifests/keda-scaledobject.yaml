@@ -1,0 +1,106 @@
+# k8s/autoscaling/keda-scaledobject.yaml
+# KEDA scales the deployment based on Prometheus metrics (request rate + latency).
+# Falls back to 0 replicas when idle (scale-to-zero).
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: tinyllama-scaler
+  namespace: llm-serving
+  labels:
+    app: tinyllama-service
+    app.kubernetes.io/part-of: llm-serving
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tinyllama-service
+
+  # Replica boundaries
+  minReplicaCount: 0      # Scale-to-zero when no traffic
+  maxReplicaCount: 5
+
+  # Seconds to wait before scaling down idle pods
+  cooldownPeriod:  120
+  pollingInterval: 15
+
+  # Advanced scaling behaviour (same as HPA spec)
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type:          Pods
+              value:         2       # Add up to 2 pods per 60s
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type:          Pods
+              value:         1
+              periodSeconds: 120
+
+  triggers:
+    # ── Trigger 1: Request rate ──────────────────────────────────────────────
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        # Scale at 10 req/s per replica
+        query: |
+          sum(rate(llm_requests_total{namespace="llm-serving"}[2m]))
+        threshold: "10"
+        activationThreshold: "1"   # Activate (wake from 0) at 1 req/s
+
+    # ── Trigger 2: P95 latency (scale up early if getting slow) ─────────────
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        query: |
+          histogram_quantile(0.95,
+            sum(rate(llm_request_latency_seconds_bucket{namespace="llm-serving"}[5m]))
+            by (le)
+          )
+        threshold: "8"            # P95 > 8s → scale up
+
+    # ── Trigger 3: GPU utilisation via DCGM ─────────────────────────────────
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        query: |
+          avg(DCGM_FI_DEV_GPU_UTIL{namespace="llm-serving"}) / 100
+        threshold: "0.8"          # >80% GPU util → scale up
+
+---
+# ── CPU/Memory HPA (fallback for CPU-only pools) ─────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tinyllama-hpa-cpu
+  namespace: llm-serving
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tinyllama-service
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               AverageUtilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type:               AverageUtilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 180
+    scaleUp:
+      stabilizationWindowSeconds: 30

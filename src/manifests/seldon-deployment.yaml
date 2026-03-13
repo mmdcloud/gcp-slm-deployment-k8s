@@ -1,0 +1,148 @@
+# k8s/seldon/seldon-deployment.yaml
+# Seldon Core wraps your BentoML container with A/B routing,
+# canary deployments, and built-in request logging.
+#
+# Prerequisites:
+#   helm install seldon-core seldon-core-operator \
+#     --repo https://storage.googleapis.com/seldon-charts \
+#     --namespace seldon-system --create-namespace \
+#     --set usageMetrics.enabled=true
+
+apiVersion: machinelearning.seldon.io/v1
+kind: SeldonDeployment
+metadata:
+  name: tinyllama-seldon
+  namespace: llm-serving
+  labels:
+    app.kubernetes.io/part-of: llm-serving
+spec:
+  name: tinyllama-seldon
+
+  # Canary / shadow traffic split (100% to v1, 0% to v2 initially)
+  predictors:
+    # ── Stable (v1) ──────────────────────────────────────────────────────────
+    - name: default
+      replicas: 1
+      traffic: 100
+      graph:
+        name:           tinyllama-container
+        implementation: UNKNOWN   # custom server
+        type:           MODEL
+        endpoint:
+          type: REST
+          httpPort: 3000
+
+      componentSpecs:
+        - spec:
+            serviceAccountName: llm-workload-ksa
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Equal
+                value: present
+                effect: NoSchedule
+            containers:
+              - name: tinyllama-container
+                image: us-central1-docker.pkg.dev/YOUR_PROJECT/llm-models/tinyllama-service:v1
+                ports:
+                  - containerPort: 3000
+                    name: http
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "6Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "4"
+                    memory: "12Gi"
+                    nvidia.com/gpu: "1"
+                env:
+                  - name: TOKENIZERS_PARALLELISM
+                    value: "false"
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 3000
+                  initialDelaySeconds: 90
+                  periodSeconds: 20
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 3000
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+                startupProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 3000
+                  failureThreshold: 30
+                  periodSeconds: 10
+                volumeMounts:
+                  - name: shm
+                    mountPath: /dev/shm
+            volumes:
+              - name: shm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 4Gi
+
+      # Seldon Canary – uncomment to activate shadow traffic to v2
+      # ── Canary (v2) ────────────────────────────────────────────────────────
+      # shadow: true
+      # traffic: 10       # Send 10% of traffic to v2
+
+    # - name: canary
+    #   replicas: 1
+    #   traffic: 0        # Set > 0 to promote
+    #   shadow: true
+    #   graph:
+    #     name:           tinyllama-container
+    #     implementation: UNKNOWN
+    #     type:           MODEL
+    #     endpoint:
+    #       type: REST
+    #       httpPort: 3000
+    #   componentSpecs:
+    #     - spec:
+    #         containers:
+    #           - name: tinyllama-container
+    #             image: .../tinyllama-service:v2
+
+  # Seldon request/response logging to GCS
+  # annotations:
+  #   seldon.io/rest-read-timeout: "90000"
+
+---
+# Seldon Ingress via GKE Gateway
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tinyllama-ingress
+  namespace: llm-serving
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.allow-http: "false"
+    networking.gke.io/managed-certificates: "tinyllama-cert"
+    networking.gke.io/v1beta1.FrontendConfig: "llm-frontend-config"
+spec:
+  rules:
+    - host: llm.YOUR_DOMAIN.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tinyllama-seldon-default
+                port:
+                  number: 80
+
+---
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: llm-frontend-config
+  namespace: llm-serving
+spec:
+  sslPolicy: llm-ssl-policy
+  redirectToHttps:
+    enabled: true

@@ -1,0 +1,230 @@
+# .github/workflows/deploy.yml
+# CI/CD pipeline: test → build → push to Artifact Registry → rolling deploy to GKE
+
+name: Build & Deploy LLM Service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bentoml/**'
+      - 'k8s/**'
+      - 'Dockerfile'
+      - 'terraform/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_tf:
+        description: 'Skip Terraform apply'
+        required: false
+        default: 'false'
+
+env:
+  PROJECT_ID:  ${{ secrets.GCP_PROJECT_ID }}
+  REGION:      us-central1
+  REGISTRY:    us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/llm-models
+  IMAGE_NAME:  tinyllama-service
+
+jobs:
+  # ── Lint & unit tests ───────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install ruff pytest bentoml pydantic
+
+      - name: Lint with Ruff
+        run: ruff check bentoml/ scripts/
+
+      - name: Validate Kubernetes YAML
+        uses: azure/k8s-lint@v2
+        with:
+          manifests: |
+            k8s/base/namespace.yaml
+            k8s/base/deployment.yaml
+            k8s/autoscaling/keda-scaledobject.yaml
+
+      - name: Validate Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+      - run: |
+          cd terraform
+          terraform init -backend=false
+          terraform validate
+
+  # ── Build & push Docker image ───────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write    # Workload Identity Federation
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      full_image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account:            ${{ secrets.WIF_SA_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
+          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
+          platforms: linux/amd64
+
+  # ── Terraform apply ─────────────────────────────────────────────────────────
+  terraform:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event.inputs.skip_tf != 'true'
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account:            ${{ secrets.WIF_SA_EMAIL }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init -reconfigure
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var-file="environments/prod/prod.tfvars" \
+            -out=tfplan \
+            -no-color
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+  # ── Deploy to GKE ───────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    needs: [build, terraform]
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.terraform.result == 'success' || needs.terraform.result == 'skipped')
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account:            ${{ secrets.WIF_SA_EMAIL }}
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: prod-llm-cluster
+          location:     ${{ env.REGION }}
+          project_id:   ${{ env.PROJECT_ID }}
+
+      - name: Apply Kubernetes manifests
+        run: |
+          FULL_IMAGE="${{ needs.build.outputs.full_image }}"
+          kubectl apply -f k8s/base/namespace.yaml
+          sed "s|IMAGE_TAG_PLACEHOLDER|${FULL_IMAGE}|g" k8s/base/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/autoscaling/keda-scaledobject.yaml
+          kubectl apply -f k8s/monitoring/prometheus-rules.yaml
+          kubectl apply -f k8s/monitoring/alertmanager-config.yaml
+          kubectl apply -f k8s/monitoring/grafana-dashboard-configmap.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/tinyllama-service \
+            -n llm-serving --timeout=600s
+
+      - name: Smoke test
+        run: |
+          kubectl run smoke-test \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --rm -i \
+            --namespace llm-serving \
+            -- curl -sf http://tinyllama-service/healthz
+          echo "Smoke test passed ✔"
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ LLM Service deployed successfully\nImage: `${{ needs.build.outputs.full_image }}`\nCommit: `${{ github.sha }}`"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "❌ LLM Service deployment FAILED\nCommit: `${{ github.sha }}`\nSee: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

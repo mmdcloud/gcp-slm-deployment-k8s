@@ -1,0 +1,34 @@
+# bentofile.yaml  – defines the Bento artifact (image + deps + service)
+service: "service:svc"   # module:service_variable
+
+labels:
+  owner: ml-platform
+  stage: production
+
+include:
+  - "service.py"
+  - "*.py"
+
+python:
+  requirements_txt: requirements.txt
+  lock_packages: true
+
+docker:
+  base_image: "pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime"
+  system_packages:
+    - libgomp1
+  env:
+    - TOKENIZERS_PARALLELISM=false
+    - OMP_NUM_THREADS=4
+    - TRANSFORMERS_CACHE=/tmp/hf_cache
+
+runners:
+  - name: llm_runner
+    resources:
+      nvidia.com/gpu: "1"         # set to 0 for CPU-only pods
+    workers_per_resource: 1
+    traffic:
+      timeout: 120
+
+build:
+  bentoml_version: ">=1.2.0"

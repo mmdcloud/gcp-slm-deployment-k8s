@@ -1,8 +1,0 @@
-apiVersion: ml.seldon.io/v1
-kind: Model
-metadata:
-  name: slm-model
-spec:
-  storageUri: "docker://your-registry/slm_service:latest"
-  requirements:
-    - gpu

@@ -1,0 +1,179 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: llm-inference-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack   # must match Prometheus selector
+    app.kubernetes.io/part-of: llm-serving
+spec:
+  groups:
+    # ── Availability ─────────────────────────────────────────────────────────
+    - name: llm.availability
+      interval: 30s
+      rules:
+        - alert: LLMServiceDown
+          expr: |
+            absent(up{job="llm-inference", namespace="llm-serving"})
+            or
+            sum(up{job="llm-inference", namespace="llm-serving"}) == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "LLM inference service is DOWN"
+            description: >
+              No healthy tinyllama-service pods found in llm-serving namespace
+              for more than 1 minute.
+            runbook: "https://wiki.internal/runbooks/llm-service-down"
+
+        - alert: LLMHighErrorRate
+          expr: |
+            (
+              sum(rate(llm_requests_total{status="error", namespace="llm-serving"}[5m]))
+              /
+              sum(rate(llm_requests_total{namespace="llm-serving"}[5m]))
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "LLM error rate > 5%"
+            description: >
+              Error rate is {{ $value | humanizePercentage }} over the last 5 minutes.
+            runbook: "https://wiki.internal/runbooks/llm-high-error-rate"
+
+        - alert: LLMErrorRateWarning
+          expr: |
+            (
+              sum(rate(llm_requests_total{status="error", namespace="llm-serving"}[5m]))
+              /
+              sum(rate(llm_requests_total{namespace="llm-serving"}[5m]))
+            ) > 0.01
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "LLM error rate > 1%"
+            description: "Error rate is {{ $value | humanizePercentage }} — investigate."
+
+    # ── Latency ───────────────────────────────────────────────────────────────
+    - name: llm.latency
+      interval: 30s
+      rules:
+        - alert: LLMHighP95Latency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(llm_request_latency_seconds_bucket{namespace="llm-serving"}[5m]))
+              by (le)
+            ) > 10
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "LLM P95 latency > 10s"
+            description: >
+              P95 inference latency is {{ $value | humanizeDuration }}.
+              KEDA should be scaling up — check GPU pool node availability.
+
+        - alert: LLMCriticalLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(llm_request_latency_seconds_bucket{namespace="llm-serving"}[5m]))
+              by (le)
+            ) > 30
+          for: 2m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "LLM P95 latency > 30s — SLA breach"
+            description: "P95 is {{ $value | humanizeDuration }}. Immediate action required."
+
+    # ── Scaling ───────────────────────────────────────────────────────────────
+    - name: llm.scaling
+      interval: 60s
+      rules:
+        - alert: LLMAtMaxReplicas
+          expr: |
+            kube_deployment_status_replicas{deployment="tinyllama-service", namespace="llm-serving"}
+            >= kube_deployment_spec_replicas{deployment="tinyllama-service", namespace="llm-serving"}
+            and
+            kube_deployment_spec_replicas{deployment="tinyllama-service", namespace="llm-serving"} >= 5
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "LLM service at max replicas (5) for 5+ minutes"
+            description: >
+              Consider increasing maxReplicaCount in the KEDA ScaledObject
+              or provisioning additional GPU nodes.
+
+        - alert: LLMScaleDownStuck
+          expr: |
+            kube_deployment_status_replicas_unavailable{
+              deployment="tinyllama-service",
+              namespace="llm-serving"
+            } > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LLM pods have been unavailable for 10 minutes"
+            description: >
+              {{ $value }} pod(s) unavailable. Check node scheduling,
+              GPU quota, and image pull status.
+
+    # ── GPU Health ────────────────────────────────────────────────────────────
+    - name: llm.gpu
+      interval: 30s
+      rules:
+        - alert: GPUHighUtilisation
+          expr: |
+            avg(DCGM_FI_DEV_GPU_UTIL{namespace="llm-serving"}) > 90
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "GPU utilisation sustained > 90%"
+            description: >
+              Average GPU util is {{ $value }}%. KEDA Prometheus trigger
+              should be scaling pods. Verify trigger configuration.
+
+        - alert: GPUMemoryNearFull
+          expr: |
+            (
+              DCGM_FI_DEV_FB_USED{namespace="llm-serving"}
+              /
+              DCGM_FI_DEV_FB_TOTAL{namespace="llm-serving"}
+            ) > 0.90
+          for: 3m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "GPU VRAM > 90% full on {{ $labels.pod }}"
+            description: >
+              GPU memory is {{ $value | humanizePercentage }} full on pod {{ $labels.pod }}.
+              Risk of OOM; reduce batch size or add replicas.
+
+        - alert: GPUNotDetected
+          expr: |
+            kube_pod_container_resource_requests{
+              resource="nvidia.com/gpu",
+              namespace="llm-serving"
+            } > 0
+            unless
+            DCGM_FI_DEV_GPU_UTIL{namespace="llm-serving"} >= 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "GPU requested but DCGM metrics absent for {{ $labels.pod }}"
+            description: "GPU driver or DCGM exporter may be down."
