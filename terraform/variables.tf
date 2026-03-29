@@ -1,14 +1,19 @@
 variable "project_id" {
-  type = string
+  type    = string
   default = ""
 }
 
 variable "env" {
-  type = string
+  type    = string
   default = ""
 }
 
 variable "region" {
-  type = string
+  type    = string
   default = ""
+}
+
+variable "node_pools" {
+  type    = number
+  default = 0
 }

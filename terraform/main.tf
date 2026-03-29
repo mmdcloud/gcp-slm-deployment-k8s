@@ -1,3 +1,5 @@
+data "google_client_config" "default" {}
+
 # ── Enable APIs ───────────────────────────────────────────────────────────────
 resource "google_project_service" "apis" {
   for_each = toset([
@@ -7,7 +9,7 @@ resource "google_project_service" "apis" {
     "logging.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
-    "iam.googleapis.com",
+    "iam.googleapis.com"
   ])
   project            = var.project_id
   service            = each.key

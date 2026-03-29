@@ -1,5 +1,3 @@
-# terraform/modules/networking/main.tf
-
 resource "google_compute_network" "vpc" {
   project                 = var.project_id
   name                    = "${var.env}-llm-vpc"

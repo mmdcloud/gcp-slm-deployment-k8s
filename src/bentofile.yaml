@@ -25,7 +25,7 @@ docker:
 runners:
   - name: llm_runner
     resources:
-      nvidia.com/gpu: "1"         # set to 0 for CPU-only pods
+      nvidia.com/gpu: "1"
     workers_per_resource: 1
     traffic:
       timeout: 120

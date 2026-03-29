@@ -1,7 +1,6 @@
 # terraform/modules/gke/main.tf
 
 resource "google_container_cluster" "primary" {
-  provider = google-beta
   name     = "${var.env}-llm-cluster"
   location = var.region
   project  = var.project_id
