@@ -1,5 +1,3 @@
-# terraform/modules/gke/main.tf
-
 resource "google_container_cluster" "primary" {
   name     = "${var.env}-llm-cluster"
   location = var.region
@@ -28,7 +26,12 @@ resource "google_container_cluster" "primary" {
   logging_config {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
-
+  master_authorized_networks_config {
+  cidr_blocks {
+    cidr_block   = "0.0.0.0/0"
+    display_name = "all"
+  }
+}
   # Private cluster
   private_cluster_config {
     enable_private_nodes    = true
@@ -57,13 +60,13 @@ resource "google_container_cluster" "primary" {
     }
   }
 
-  maintenance_policy {
-    recurring_window {
-      start_time = "2024-01-01T04:00:00Z"
-      end_time   = "2024-01-01T08:00:00Z"
-      recurrence = "FREQ=WEEKLY;BYDAY=SU"
-    }
-  }
+  # maintenance_policy {
+  #   recurring_window {
+  #     start_time = "2024-01-01T04:00:00Z"
+  #     end_time   = "2024-01-01T08:00:00Z"
+  #     recurrence = "FREQ=WEEKLY;BYDAY=SU"
+  #   }
+  # }
 
   resource_labels = {
     env  = var.env
@@ -89,8 +92,8 @@ resource "google_container_node_pool" "pools" {
     auto_repair  = true
     auto_upgrade = true
   }
-
-  node_config {
+  
+  node_config {    
     machine_type = each.value.machine_type
     disk_size_gb = each.value.disk_size_gb
     preemptible  = each.value.preemptible
@@ -112,7 +115,7 @@ resource "google_container_node_pool" "pools" {
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
-
+    
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform",
     ]

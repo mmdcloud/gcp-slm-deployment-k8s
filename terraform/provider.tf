@@ -1,41 +1,50 @@
 terraform {
+  required_version = ">= 1.6.0"
+
   required_providers {
     google = {
       source  = "hashicorp/google"
       version = "~> 7.0"
     }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 3.0"
-    }
     helm = {
       source  = "hashicorp/helm"
       version = "~> 3.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 3.0"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.10"
+    }
   }
 }
 
-# ── Providers ─────────────────────────────────────────────────────────────────
 provider "google" {
   project = var.project_id
   region  = var.region
 }
 
-# provider "google-beta" {
-#   project = var.project_id
-#   region  = var.region
-# }
+# -----------------------------------------------------------------
+# Kubernetes and Helm providers use GKE cluster credentials directly
+# -----------------------------------------------------------------
+data "google_client_config" "default" {}
 
 provider "kubernetes" {
-  host                   = "https://${module.gke.endpoint}"
-  token                  = data.google_client_config.default.access_token
-  cluster_ca_certificate = base64decode(module.gke.ca_certificate)
+  host  = "https://${google_container_cluster.primary.endpoint}"
+  token = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(
+    google_container_cluster.primary.master_auth[0].cluster_ca_certificate
+  )
 }
 
 provider "helm" {
   kubernetes = {
-    host                   = "https://${module.gke.endpoint}"
-    token                  = data.google_client_config.default.access_token
-    cluster_ca_certificate = base64decode(module.gke.ca_certificate)
+    host  = "https://${google_container_cluster.primary.endpoint}"
+    token = data.google_client_config.default.access_token
+    cluster_ca_certificate = base64decode(
+      google_container_cluster.primary.master_auth[0].cluster_ca_certificate
+    )
   }
 }
